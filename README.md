@@ -1,6 +1,6 @@
 # MIT 6.824 Distributed Systems (Spring 2020) course
 
-Notes and code the MIT course. [Official website](https://pdos.csail.mit.edu/6.824/).
+My notes and solutions for the 6.824 course. [Official website](https://pdos.csail.mit.edu/6.824/).
 
 ## Papers
 
@@ -8,7 +8,7 @@ Notes and code the MIT course. [Official website](https://pdos.csail.mit.edu/6.8
 
 ## Development
 
-For labs, I am using Docker image and a shared folder with host machine to write code. Course is using Golang 1.13.
+For labs, I am using Docker image and a shared with host machine folder to write code. Golang **1.13** is used.
 
 Pull the image:
 
@@ -19,7 +19,7 @@ docker pull golang:1.13
 Run the image:
 
 ```bash
-docker run --rm -v $PWD:/pwd --name go-mit -i golang:1.13
+docker run --rm -v $PWD:/pwd --name go-mit -it golang:1.13 bash
 ```
 
 ## Tips
