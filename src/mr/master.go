@@ -1,27 +1,80 @@
 package mr
 
-import "log"
-import "net"
-import "os"
-import "net/rpc"
-import "net/http"
+import (
+	"log"
+	"net"
+	"os"
+	"fmt"
+	"net/rpc"
+	"net/http"
+	"sync"
+)
 
 type Master struct {
-	// Your definitions here.
+	mux sync.Mutex
 
+	Tasks []Task
+	NReduce int
 }
 
-// Job defines map or reduce job
-type Job struct {
+// Task defines map or reduce operation
+type Task struct {
 	Filename string
-	Type     string
-	ID       int
+	State    string  // "idle", "in-progress" or "completed"; according to MapReduce paper
+	Type     string  // "map" or "reduce"
+	Id       int
 }
 
-// WantJob workers requests for a job
-func (m *Master) WantJob(args *NewJobRequest, reply *NewJobReply) error {
-	reply.Filename = "pg-grimm.txt"
-	reply.Type = "map"
+// WantTask worker requests for a job
+func (m *Master) WantTask(args *Empty, reply *NewJobReply) error {
+	// default values if no Task to process
+	reply.Filename = ""
+	reply.Type = ""
+
+	// TODO: maybe scope for Lock is too big, leaving it here for now
+	m.mux.Lock()
+	for i, task := range m.Tasks {
+		if task.State == "idle" {
+			reply.Filename = task.Filename
+			reply.Type = task.Type
+			reply.NReduce = m.NReduce
+			if task.Type == "reduce" {
+				reply.NReduce = task.Id
+			}
+			reply.Id = i
+			m.Tasks[i].State = "in-progess"
+			break
+		}
+	}
+	m.mux.Unlock()
+	return nil
+}
+
+// TaskDone worker calls this when map/reduce task is finished
+func (m *Master) TaskDone(args *JobDoneRequest, reply *Empty) error {
+	mapDone := true
+
+	m.mux.Lock()
+	m.Tasks[args.Id].State = "completed"
+
+	fmt.Printf("Finished: %s\n", m.Tasks[args.Id].Type)
+
+	if m.Tasks[args.Id].Type == "map" {
+		// check if last map is finished
+		for _, task := range m.Tasks {
+			if task.Type == "map" && task.State != "completed" {
+				mapDone = false
+			}
+		}
+
+		if mapDone {
+			fmt.Printf("Map phase done. Start reduce\n")
+			for i := 0; i < m.NReduce; i++ {
+				m.Tasks = append(m.Tasks, Task{"dymmy.txt", "idle", "reduce", i})
+			}
+		}
+	}
+	m.mux.Unlock()
 	return nil
 }
 
@@ -46,11 +99,19 @@ func (m *Master) server() {
 // if the entire job has finished.
 //
 func (m *Master) Done() bool {
-	ret := false
+	finishedReduceTasks := m.NReduce
 
-	// Your code here.
+	m.mux.Lock()
+	for _, task := range m.Tasks {
+		if task.State == "completed" && task.Type == "reduce" {
+			finishedReduceTasks--
+		}
+	}
+	m.mux.Unlock()
 
-	return ret
+	fmt.Printf("Unfinished reduce tasks: %d\n", finishedReduceTasks)
+
+	return (finishedReduceTasks == 0)
 }
 
 //
@@ -61,7 +122,10 @@ func (m *Master) Done() bool {
 func MakeMaster(files []string, nReduce int) *Master {
 	m := Master{}
 
-	// Your code here.
+	m.NReduce = nReduce
+	for i, filename := range files {
+		m.Tasks = append(m.Tasks, Task{filename, "idle", "map", i})
+	}
 
 	m.server()
 	return &m

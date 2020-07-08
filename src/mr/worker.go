@@ -2,14 +2,24 @@ package mr
 
 import (
 	"encoding/json"
+	"path/filepath"
 	"fmt"
 	"hash/fnv"
 	"io/ioutil"
 	"log"
 	"net/rpc"
 	"os"
+	"sort"
 	"time"
 )
+
+// for sorting by key.
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 //
 // Map functions return a slice of KeyValue.
@@ -34,16 +44,17 @@ func ihash(key string) int {
 //
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
-
-	request := NewJobRequest{}
-	reply := NewJobReply{}
 	for {
-		call("Master.WantJob", &request, &reply)
+		empty := Empty{}
+		request := JobDoneRequest{}
+		reply := NewJobReply{}
+
+		call("Master.WantTask", &empty, &reply)
 
 		fmt.Printf("newJobReply.Filename %s\n", reply.Filename)
 		fmt.Printf("newJobReply.Type %s\n", reply.Type)
 
-		// empty Filename, no new job
+		// empty Filename, no Task
 		if reply.Filename == "" {
 			time.Sleep(time.Second)
 			continue
@@ -61,19 +72,71 @@ func Worker(mapf func(string, string) []KeyValue,
 			file.Close()
 
 			kva := mapf(reply.Filename, string(content))
-			reduceKeyNum := ihash(reply.Filename) % 10
 
-			newFileName := fmt.Sprintf("mr-%d-%d.json", 1, reduceKeyNum)
-			mapResultsFile, _ := os.OpenFile(newFileName, os.O_CREATE, os.ModePerm)
-			defer mapResultsFile.Close()
+			var reduceKeyNum int
+			var outputFileName string
 
-			enc := json.NewEncoder(mapResultsFile)
 			for _, kv := range kva {
+				reduceKeyNum = ihash(kv.Key) % reply.NReduce
+				outputFileName = fmt.Sprintf("mr-%d-%d.json", reply.Id, reduceKeyNum)
+
+				outputFile, _ := os.OpenFile(outputFileName, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0755)
+				defer outputFile.Close()
+
+				enc := json.NewEncoder(outputFile)
 				enc.Encode(&kv)
 			}
 		} else if reply.Type == "reduce" {
+			pattern := fmt.Sprintf("mr-*-%d.json", reply.NReduce)
+			matches, err := filepath.Glob(pattern)
 
+			if err != nil {
+				fmt.Println(err)
+			}
+
+			var intermediate []KeyValue
+
+			// read all intermediate data
+			for _, filename := range matches {
+				intermediateFile, _ := os.Open(filename)
+
+				dec := json.NewDecoder(intermediateFile)
+				for {
+					var kv KeyValue
+					if err := dec.Decode(&kv); err != nil {
+					  break
+					}
+					intermediate = append(intermediate, kv)
+				}
+				intermediateFile.Close()
+			}
+
+			sort.Sort(ByKey(intermediate))
+
+			outputFileName := fmt.Sprintf("mr-out-%d", reply.NReduce)
+			outputFile, _ := os.Create(outputFileName)
+			defer outputFile.Close()
+
+			i := 0
+			for i < len(intermediate) {
+				j := i + 1
+				for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+					j++
+				}
+				values := []string{}
+				for k := i; k < j; k++ {
+					values = append(values, intermediate[k].Value)
+				}
+				output := reducef(intermediate[i].Key, values)
+
+				// this is the correct format for each line of Reduce output.
+				fmt.Fprintf(outputFile, "%v %v\n", intermediate[i].Key, output)
+
+				i = j
+			}
 		}
+		request.Id = reply.Id
+		call("Master.TaskDone", &request, &empty)
 	}
 }
 

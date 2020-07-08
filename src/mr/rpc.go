@@ -9,15 +9,20 @@ package mr
 import "os"
 import "strconv"
 
-// NewJobRequest dummy request
-type NewJobRequest struct {
-	X int
-}
+// Empty empty structure
+type Empty struct {}
 
 // NewJobReply get filename to process
 type NewJobReply struct {
 	Filename string
 	Type     string // "map" or "reduce"
+	NReduce  int
+	Id       int
+}
+
+// JobDoneRequest if job is done return job id
+type JobDoneRequest struct {
+	Id       int
 }
 
 // Cook up a unique-ish UNIX-domain socket name
