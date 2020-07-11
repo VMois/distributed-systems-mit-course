@@ -2,13 +2,14 @@ package mr
 
 import (
 	"encoding/json"
-	"path/filepath"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"io/ioutil"
 	"log"
 	"net/rpc"
 	"os"
+	"path/filepath"
 	"sort"
 	"time"
 )
@@ -49,10 +50,10 @@ func Worker(mapf func(string, string) []KeyValue,
 		request := JobDoneRequest{}
 		reply := NewJobReply{}
 
-		call("Master.WantTask", &empty, &reply)
-
-		fmt.Printf("newJobReply.Filename %s\n", reply.Filename)
-		fmt.Printf("newJobReply.Type %s\n", reply.Type)
+		// if something goes wrong with connection, worker exits
+		if !call("Master.WantTask", &empty, &reply) {
+			break
+		}
 
 		// empty Filename, no Task
 		if reply.Filename == "" {
@@ -75,16 +76,23 @@ func Worker(mapf func(string, string) []KeyValue,
 
 			var reduceKeyNum int
 			var outputFileName string
+			nameToFile := make(map[string]*os.File)
 
 			for _, kv := range kva {
 				reduceKeyNum = ihash(kv.Key) % reply.NReduce
 				outputFileName = fmt.Sprintf("mr-%d-%d.json", reply.Id, reduceKeyNum)
-
-				outputFile, _ := os.OpenFile(outputFileName, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0755)
-				defer outputFile.Close()
-
+				outputFile, exists := nameToFile[outputFileName]
+				if !exists {
+					outputFile, _ = os.Create(outputFileName)
+					nameToFile[outputFileName] = outputFile
+				}
 				enc := json.NewEncoder(outputFile)
 				enc.Encode(&kv)
+			}
+
+			// atomically move temp files
+			for _, outputFile := range nameToFile {
+				outputFile.Close()
 			}
 		} else if reply.Type == "reduce" {
 			pattern := fmt.Sprintf("mr-*-%d.json", reply.NReduce)
@@ -104,7 +112,7 @@ func Worker(mapf func(string, string) []KeyValue,
 				for {
 					var kv KeyValue
 					if err := dec.Decode(&kv); err != nil {
-					  break
+						break
 					}
 					intermediate = append(intermediate, kv)
 				}
@@ -134,7 +142,13 @@ func Worker(mapf func(string, string) []KeyValue,
 
 				i = j
 			}
+
+			// remove intermediate files
+			for _, filename := range matches {
+				os.Remove(filename)
+			}
 		}
+
 		request.Id = reply.Id
 		call("Master.TaskDone", &request, &empty)
 	}
@@ -161,4 +175,28 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 
 	fmt.Println(err)
 	return false
+}
+
+func moveFile(sourcePath, destPath string) error {
+	inputFile, err := os.Open(sourcePath)
+	if err != nil {
+		return fmt.Errorf("Couldn't open source file: %s", err)
+	}
+	outputFile, err := os.Create(destPath)
+	if err != nil {
+		inputFile.Close()
+		return fmt.Errorf("Couldn't open dest file: %s", err)
+	}
+	defer outputFile.Close()
+	_, err = io.Copy(outputFile, inputFile)
+	inputFile.Close()
+	if err != nil {
+		return fmt.Errorf("Writing to output file failed: %s", err)
+	}
+	// The copy was successful, so now delete the original file
+	err = os.Remove(sourcePath)
+	if err != nil {
+		return fmt.Errorf("Failed removing original file: %s", err)
+	}
+	return nil
 }

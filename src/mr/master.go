@@ -3,26 +3,30 @@ package mr
 import (
 	"log"
 	"net"
-	"os"
-	"fmt"
-	"net/rpc"
 	"net/http"
+	"net/rpc"
+	"os"
 	"sync"
 )
 
+// Master master node internal state, logically represent a single MapReduce job
 type Master struct {
 	mux sync.Mutex
 
-	Tasks []Task
-	NReduce int
+	mapTasksNum    int
+	reduceTasksNum int
+	Tasks          []Task
+	NReduce        int
+	ttl            int
 }
 
 // Task defines map or reduce operation
 type Task struct {
 	Filename string
-	State    string  // "idle", "in-progress" or "completed"; according to MapReduce paper
-	Type     string  // "map" or "reduce"
+	State    string // "idle", "in-progress" or "completed"; according to MapReduce paper
+	Type     string // "map" or "reduce"
 	Id       int
+	ttl      int // time to live
 }
 
 // WantTask worker requests for a job
@@ -42,7 +46,7 @@ func (m *Master) WantTask(args *Empty, reply *NewJobReply) error {
 				reply.NReduce = task.Id
 			}
 			reply.Id = i
-			m.Tasks[i].State = "in-progess"
+			m.Tasks[i].State = "in-progress"
 			break
 		}
 	}
@@ -52,28 +56,24 @@ func (m *Master) WantTask(args *Empty, reply *NewJobReply) error {
 
 // TaskDone worker calls this when map/reduce task is finished
 func (m *Master) TaskDone(args *JobDoneRequest, reply *Empty) error {
-	mapDone := true
-
 	m.mux.Lock()
 	m.Tasks[args.Id].State = "completed"
 
-	fmt.Printf("Finished: %s\n", m.Tasks[args.Id].Type)
-
 	if m.Tasks[args.Id].Type == "map" {
-		// check if last map is finished
-		for _, task := range m.Tasks {
-			if task.Type == "map" && task.State != "completed" {
-				mapDone = false
-			}
-		}
+		m.mapTasksNum--
+	}
 
-		if mapDone {
-			fmt.Printf("Map phase done. Start reduce\n")
-			for i := 0; i < m.NReduce; i++ {
-				m.Tasks = append(m.Tasks, Task{"dymmy.txt", "idle", "reduce", i})
-			}
+	if m.Tasks[args.Id].Type == "reduce" {
+		m.reduceTasksNum--
+	}
+
+	// all map tasks are finished, create reduce tasks
+	if m.mapTasksNum == 0 && m.reduceTasksNum == m.NReduce {
+		for i := 0; i < m.NReduce; i++ {
+			m.Tasks = append(m.Tasks, Task{"dymmy.txt", "idle", "reduce", i, m.ttl})
 		}
 	}
+
 	m.mux.Unlock()
 	return nil
 }
@@ -99,19 +99,25 @@ func (m *Master) server() {
 // if the entire job has finished.
 //
 func (m *Master) Done() bool {
-	finishedReduceTasks := m.NReduce
 
 	m.mux.Lock()
-	for _, task := range m.Tasks {
-		if task.State == "completed" && task.Type == "reduce" {
-			finishedReduceTasks--
+	isDone := m.mapTasksNum == 0 && m.reduceTasksNum == 0
+
+	for i, task := range m.Tasks {
+		if task.State == "in-progress" {
+			m.Tasks[i].ttl--
+		}
+
+		if task.State == "in-progress" && task.ttl == 0 {
+			m.Tasks[i].State = "idle"
+			m.Tasks[i].ttl = m.ttl
+			isDone = false
 		}
 	}
+
 	m.mux.Unlock()
 
-	fmt.Printf("Unfinished reduce tasks: %d\n", finishedReduceTasks)
-
-	return (finishedReduceTasks == 0)
+	return isDone
 }
 
 //
@@ -123,8 +129,12 @@ func MakeMaster(files []string, nReduce int) *Master {
 	m := Master{}
 
 	m.NReduce = nReduce
+	m.mapTasksNum = len(files)
+	m.reduceTasksNum = nReduce
+	m.ttl = 10 // 10 seconds (Done is called every second)
+
 	for i, filename := range files {
-		m.Tasks = append(m.Tasks, Task{filename, "idle", "map", i})
+		m.Tasks = append(m.Tasks, Task{filename, "idle", "map", i, m.ttl})
 	}
 
 	m.server()
