@@ -5,6 +5,9 @@ My notes and solutions for the 6.824 course. [Official website](https://pdos.csa
 ## Papers
 
 1. [MapReduce](https://static.googleusercontent.com/media/research.google.com/en//archive/mapreduce-osdi04.pdf)
+2. GFS
+3. VMWare FT
+4. Extended Raft
 
 ## Development
 
