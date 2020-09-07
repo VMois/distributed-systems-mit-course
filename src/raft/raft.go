@@ -47,6 +47,12 @@ type ApplyMsg struct {
 	CommandIndex int
 }
 
+const (
+	CANDIDATE = "candidate"
+	FOLLOWER = "follower"
+	LEADER = "leader"
+)
+
 // Raft peer
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -70,13 +76,14 @@ type Raft struct {
 
 	// other stuff
 	electionTimeout int    // in ms
-	role            string // "follower", "candidate", "leader"
+	role            string // constants CANDIDATE, FOLLOWER and LEADER
 	votesNum        int
 }
 
-// SetElectionTimeout choose randomly new rf.electionTimeout, not thread safe
-func (rf *Raft) SetElectionTimeout() {
-	rf.electionTimeout = rand.Intn(400-300) + 300
+// SetElectionTimeout choose randomly new electionTimeout (not thread safe!)
+func (rf *Raft) ResetElectionTimeout() {
+	// timeout between 150-300ms, taken from the original paper
+	rf.electionTimeout = rand.Intn(300-150) + 150
 }
 
 // GetState returns currentTerm and whether this server
@@ -87,7 +94,7 @@ func (rf *Raft) GetState() (int, bool) {
 
 	rf.mu.Lock()
 	term = rf.currentTerm
-	isLeader = rf.role == "leader"
+	isLeader = rf.role == LEADER
 	rf.mu.Unlock()
 
 	return term, isLeader
@@ -131,22 +138,6 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-// AppendEntriesArgs RPC argument struct. Fields must be in caps
-type AppendEntriesArgs struct {
-	Term         int
-	LeaderID     int
-	PrevLogIndex int
-	PrevLogTerm  int
-	Entries      []ApplyMsg
-	LeaderCommit int
-}
-
-// AppendEntriesReply RPC reply struct. Fields must be in caps
-type AppendEntriesReply struct {
-	Term    int
-	Success bool
-}
-
 // RequestVoteArgs RPC argument struct. Fields must be in caps
 type RequestVoteArgs struct {
 	Term         int
@@ -166,25 +157,39 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	fmt.Println("Receive vote request on ", rf.me)
+	fmt.Println("Receive vote request on ", rf.me, " from ", args.CandidateID)
 
 	// new election term, reset
 	if args.Term > rf.currentTerm {
-		rf.currentTerm = args.Term
-		rf.role = "follower"
+	 	rf.currentTerm = args.Term
+		rf.role = FOLLOWER
 		rf.votedFor = -1
 	}
 
 	reply.Term = rf.currentTerm
-	reply.VoteGranted = true
+	reply.VoteGranted = false
 
-	if args.Term < rf.currentTerm || rf.votedFor != -1 {
-		reply.VoteGranted = false
-	} else {
+	if args.Term == rf.currentTerm && (rf.votedFor == -1 || rf.votedFor == args.CandidateID) {
 		rf.votedFor = args.CandidateID
-		// restart electionTimeout only when vote is granted
-		rf.SetElectionTimeout()
+		rf.ResetElectionTimeout()
+		reply.VoteGranted = true
 	}
+}
+
+// AppendEntriesArgs RPC argument struct. Fields must be in caps
+type AppendEntriesArgs struct {
+	Term         int
+	LeaderID     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []ApplyMsg
+	LeaderCommit int
+}
+
+// AppendEntriesReply RPC reply struct. Fields must be in caps
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
 }
 
 // AppendEntries handles hearbeats and new log entries
@@ -196,23 +201,29 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	rf.CheckTerm(args.Term)
 
-	rf.role = "follower"
-	rf.SetElectionTimeout()
+	reply.Term = rf.currentTerm
 
+	// request comes from the "past" term, ignore request
 	if args.Term < rf.currentTerm {
 		reply.Success = false
+		return
 	}
+
+	rf.role = FOLLOWER
+	rf.ResetElectionTimeout()
+	reply.Success = true
 }
 
 // CheckTerm check incoming term
 func (rf *Raft) CheckTerm(term int) {
 	if term > rf.currentTerm {
 		rf.currentTerm = term
-		rf.role = "follower"
+		rf.role = FOLLOWER
+		rf.votedFor = -1
 	}
 }
 
-func (rf *Raft) sendHeatbeat(server int) {
+func (rf *Raft) sendHeartbeat(server int) {
 	args := AppendEntriesArgs{}
 	reply := AppendEntriesReply{}
 
@@ -287,6 +298,19 @@ func (rf *Raft) sendRequestVote(server int) {
 		if reply.VoteGranted {
 			fmt.Println("Granted vote from ", server, " to ", rf.me)
 			rf.votesNum++
+			
+			// TODO: what if network partition will happen. Majority number will change.
+			// If majority votes, become leader
+			if rf.role == CANDIDATE && rf.votesNum > (len(rf.peers) / 2) {
+				fmt.Println("Newly elected leader: ", rf.me, " on term ", rf.currentTerm)
+				rf.role = LEADER
+				rf.ResetElectionTimeout()
+				for i := range rf.peers {
+					if i != rf.me {
+						go rf.sendHeartbeat(i)
+					}
+				}
+			}
 		}
 	}
 	rf.mu.Unlock()
@@ -318,7 +342,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 // Main runs main server loop
 func (rf *Raft) Main() {
-	period := 100
+	const period = 100
 	for {
 		time.Sleep(time.Duration(period) * time.Millisecond)
 		rf.mu.Lock()
@@ -332,12 +356,12 @@ func (rf *Raft) Main() {
 		rf.electionTimeout -= period
 
 		// convert to candidate, start election
-		if rf.electionTimeout <= 0 && rf.role != "leader" {
-			rf.role = "candidate"
+		if rf.role != LEADER && rf.electionTimeout <= 0 {
+			rf.role = CANDIDATE
 			rf.currentTerm++
 			rf.votedFor = rf.me
 			rf.votesNum = 1
-			rf.SetElectionTimeout()
+			rf.ResetElectionTimeout()
 
 			fmt.Println("Election started by: ", rf.me, " New term: ", rf.currentTerm)
 
@@ -347,18 +371,11 @@ func (rf *Raft) Main() {
 					go rf.sendRequestVote(i)
 				}
 			}
-		} else if rf.role == "candidate" {
-			// TODO: what if network partition will happen. Majority number will change
-			// if majority votes, become leader
-			if rf.votesNum > (len(rf.peers) / 2) {
-				fmt.Println("Newly elected leader: ", rf.me)
-				rf.role = "leader"
-			}
-		} else if rf.role == "leader" {
+		} else if rf.role == LEADER {
 			// send heartbeats
 			for i := range rf.peers {
 				if i != rf.me {
-					go rf.sendHeatbeat(i)
+					go rf.sendHeartbeat(i)
 				}
 			}
 		}
@@ -415,9 +432,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 
-	rf.role = "follower"
+	rf.role = FOLLOWER
 	rf.votesNum = 0
-	rf.SetElectionTimeout()
+	rf.ResetElectionTimeout()
 
 	go rf.Main()
 
