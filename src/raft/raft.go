@@ -326,9 +326,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
 
-	if (args.Term == rf.currentTerm) && (rf.votedFor == -1 || rf.votedFor == args.CandidateID) {
+	if (args.Term == rf.currentTerm) && ((rf.votedFor == -1) || (rf.votedFor == args.CandidateID)) {
 		lastLogEntry, lastLogIndex := rf.getLastLogEntry()
-		if (lastLogIndex == args.LastLogIndex) || (lastLogEntry.Term == args.LastLogTerm) {
+		if (lastLogEntry.Term < args.LastLogTerm) ||
+			((lastLogEntry.Term == args.LastLogTerm) && (lastLogIndex <= args.LastLogIndex)) {
 			rf.votedFor = args.CandidateID
 			rf.resetElectionTimeout()
 			reply.VoteGranted = true
