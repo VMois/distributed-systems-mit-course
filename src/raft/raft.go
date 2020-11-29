@@ -175,10 +175,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
+	rf.resetElectionTimeout()
+
 	// this is a hearbeat message
 	if len(args.Entries) == 0 {
-		rf.role = follower
-		rf.resetElectionTimeout()
 		reply.Success = true
 		return
 	}
@@ -244,7 +244,8 @@ func (rf *Raft) sendNewLogEntries() {
 	}
 }
 
-// check incoming term, convert to follower if needed, not thread safe
+// check incoming term, convert to follower if needed
+// not thread safe
 func (rf *Raft) checkTerm(term int) {
 	if term > rf.currentTerm {
 		rf.currentTerm = term
