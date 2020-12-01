@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -55,6 +56,8 @@ const (
 	candidate = "candidate"
 	follower  = "follower"
 	leader    = "leader"
+
+	logging = false
 )
 
 // Raft peer
@@ -75,16 +78,17 @@ type Raft struct {
 	lastApplied int
 
 	// votalite state on leaders
-	nextIndex  []int
-	matchIndex []int
+	nextIndex  map[int]int
+	matchIndex map[int]int
 
-	// other stuff
+	// additional variables
 	electionTimeout int    // in ms
 	role            string // constants candidate, follower, leader
 	votesNum        int
 }
 
-// choose randomly new electionTimeout, not thread safe
+// choose randomly new electionTimeout
+// not thread safe
 func (rf *Raft) resetElectionTimeout() {
 	// timeout between 150-300ms, taken from the original Raft extended paper
 	rf.electionTimeout = rand.Intn(300-150) + 150
@@ -179,6 +183,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// this is a hearbeat message
 	if len(args.Entries) == 0 {
+		if logging {
+			fmt.Println(rf.me, " received heartbeats from ", args.LeaderID)
+		}
 		reply.Success = true
 		return
 	}
@@ -255,12 +262,14 @@ func (rf *Raft) checkTerm(term int) {
 }
 
 // not thread safe
+// TODO: function is not correct needs fixes
 func (rf *Raft) getNewEntries() []logEntry {
 	_, lastLogIndex := rf.getLastLogEntry()
 	return rf.log[rf.commitIndex+1 : lastLogIndex+1]
 }
 
 // not thread safe
+// TODO: function is not correct, needs fixes
 func (rf *Raft) getLastLogEntry() (lastLogEntry logEntry, lastLogIndex int) {
 	lastIndex := len(rf.log) - 1
 	if lastIndex >= 0 {
@@ -284,7 +293,6 @@ func (rf *Raft) sendHeartbeats() {
 		if i != rf.me {
 			go func(params AppendEntriesArgs, serverId int) {
 				reply := AppendEntriesReply{}
-				// fmt.Println("Sending heartBeat from ", rf.me, " to ", server)
 				ok := rf.peers[serverId].Call("Raft.AppendEntries", &params, &reply)
 				rf.mu.Lock()
 				if ok {
@@ -293,6 +301,27 @@ func (rf *Raft) sendHeartbeats() {
 				rf.mu.Unlock()
 			}(args, i)
 		}
+	}
+}
+
+func (rf *Raft) logEntriesProcess() {
+	const defaultPeriod = 10
+
+	for !rf.killed() {
+		rf.mu.Lock()
+		if rf.role == leader {
+			if (len(rf.log) - 1) > rf.commitIndex {
+				rf.sendNewLogEntries()
+			} else {
+				if logging {
+					fmt.Println("No new log. ", rf.me, " leader started sending heartbeats")
+				}
+				rf.sendHeartbeats()
+			}
+		}
+		rf.mu.Unlock()
+
+		time.Sleep(time.Duration(defaultPeriod) * time.Millisecond)
 	}
 }
 
@@ -354,7 +383,9 @@ func (rf *Raft) sendRequestVote(args RequestVoteArgs, server int) {
 
 			// if majority votes, become leader
 			if rf.votesNum > (len(rf.peers) / 2) {
-				// fmt.Println("Newly elected leader: ", rf.me, " on term ", rf.currentTerm)
+				if logging {
+					fmt.Println("Newly elected leader: ", rf.me, " on term ", rf.currentTerm)
+				}
 				rf.role = leader
 				rf.resetElectionTimeout()
 				rf.sendHeartbeats()
@@ -362,6 +393,35 @@ func (rf *Raft) sendRequestVote(args RequestVoteArgs, server int) {
 		}
 	}
 	rf.mu.Unlock()
+}
+
+func (rf *Raft) electionProcess() {
+	const defaultPeriod = 50
+	period := defaultPeriod
+
+	for !rf.killed() {
+		rf.mu.Lock()
+
+		if rf.role != leader {
+			rf.electionTimeout -= period
+		}
+
+		if rf.electionTimeout <= 0 {
+			if logging {
+				fmt.Println(rf.me, " starts election process")
+			}
+			rf.startElection()
+		}
+
+		if rf.electionTimeout > defaultPeriod {
+			period = defaultPeriod
+		} else {
+			period = rf.electionTimeout
+		}
+		rf.mu.Unlock()
+
+		time.Sleep(time.Duration(period) * time.Millisecond)
+	}
 }
 
 // not thread safe
@@ -372,7 +432,6 @@ func (rf *Raft) startElection() {
 	rf.votesNum = 1
 	rf.resetElectionTimeout()
 
-	// fmt.Println("Election started by: ", rf.me, " New term: ", rf.currentTerm)
 	args := RequestVoteArgs{}
 	args.Term = rf.currentTerm
 	args.CandidateID = rf.me
@@ -418,33 +477,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	return index, term, isLeader
 }
 
-// Main runs main server loop
+// Main starts main server services
 func (rf *Raft) Main() {
-	const period = 100
-	for {
-		time.Sleep(time.Duration(period) * time.Millisecond)
-		rf.mu.Lock()
-
-		// exit if server is down
-		if rf.killed() {
-			rf.mu.Unlock()
-			return
-		}
-
-		rf.electionTimeout -= period
-
-		if rf.role != leader && rf.electionTimeout <= 0 {
-			rf.startElection()
-		} else if rf.role == leader {
-			if (len(rf.log) - 1) > rf.commitIndex {
-				rf.sendNewLogEntries()
-			} else {
-				rf.sendHeartbeats()
-			}
-		}
-
-		rf.mu.Unlock()
-	}
+	go rf.electionProcess()
+	go rf.logEntriesProcess()
 }
 
 //
