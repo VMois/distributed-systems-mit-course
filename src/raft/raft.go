@@ -156,6 +156,31 @@ func (rf *Raft) applyNewEntriesProcess() {
 
 	for !rf.killed() {
 		rf.mu.Lock()
+		if rf.role == leader && ((len(rf.log) - 1) > rf.commitIndex) {
+
+			// Raft (Extended), fig. 2, Rules for Servers/Leades
+			n := rf.commitIndex + 1
+			for n <= len(rf.log)-1 {
+				if rf.log[n].Term != rf.currentTerm {
+					break
+				}
+				count := 0
+
+				for i := range rf.peers {
+					if rf.matchIndex[i] >= n {
+						count++
+					}
+				}
+
+				// no majority
+				if count < (len(rf.peers) / 2) {
+					break
+				}
+				n++
+			}
+			rf.commitIndex = n - 1
+		}
+
 		if rf.commitIndex > prevCommitIndex {
 			if logging {
 				fmt.Println(rf.me, " applies new entries")
@@ -211,7 +236,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	if logging {
-		fmt.Println(rf.me, " received new entries from ", args.LeaderID)
+		if len(args.Entries) > 0 {
+			fmt.Println(rf.me, " received new entries from ", args.LeaderID, "Len: ", len(args.Entries))
+		} else {
+			fmt.Println(rf.me, " received heartbeat from ", args.LeaderID)
+		}
 	}
 
 	for i, newEntry := range args.Entries {
@@ -240,53 +269,38 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Success = true
 }
 
-// not thread safe
-func (rf *Raft) sendNewLogEntries(prevLogIndex int) {
+func (rf *Raft) sendNewLogEntries(serverID int, nextIndexForServer int) {
+	if logging {
+		fmt.Println(rf.me, " is sending new logs for ", serverID, " starting ", nextIndexForServer)
+	}
 	args := AppendEntriesArgs{}
 
 	rf.mu.Lock()
 	args.Term = rf.currentTerm
 	args.LeaderID = rf.me
 
+	prevLogIndex := nextIndexForServer - 1
+	lastLogIndex := len(rf.log) - 1
 	args.PrevLogIndex = prevLogIndex
-	args.PrevLogTerm = 0
 	args.PrevLogTerm = rf.log[prevLogIndex].Term
+
 	args.LeaderCommit = rf.commitIndex
-	args.Entries = rf.getNewEntries(prevLogIndex)
+	args.Entries = rf.log[nextIndexForServer : lastLogIndex+1]
 	rf.mu.Unlock()
-	approvedEntries := 0
 
-	for i := range rf.peers {
-		if i != rf.me {
-			go func(params AppendEntriesArgs, serverId int) {
-				reply := AppendEntriesReply{}
-				// fmt.Println("Sending new entries from ", rf.me, " to ", server)
-				ok := rf.peers[serverId].Call("Raft.AppendEntries", &params, &reply)
-				rf.mu.Lock()
-				if ok {
-					rf.checkTerm(reply.Term)
-					approvedEntries++
-				}
-				rf.mu.Unlock()
-			}(args, i)
+	reply := AppendEntriesReply{}
+	ok := rf.peers[serverID].Call("Raft.AppendEntries", &args, &reply)
+	rf.mu.Lock()
+	if ok {
+		rf.checkTerm(reply.Term)
+		if reply.Success {
+			rf.nextIndex[serverID] = lastLogIndex + 1
+			rf.matchIndex[serverID] = lastLogIndex
+		} else {
+			rf.nextIndex[serverID]--
 		}
 	}
-	for !rf.killed() {
-		rf.mu.Lock()
-		if rf.role == leader {
-			if approvedEntries > (len(rf.peers) / 2) {
-				if logging {
-					fmt.Println(rf.me, " got a majority to commit new entries")
-				}
-				rf.commitIndex = prevLogIndex + len(args.Entries)
-				rf.mu.Unlock()
-				return
-			}
-		}
-		rf.mu.Unlock()
-
-		time.Sleep(time.Duration(5) * time.Millisecond)
-	}
+	rf.mu.Unlock()
 }
 
 // check incoming term, convert to follower if needed
@@ -314,54 +328,51 @@ func (rf *Raft) getLastLogEntry() (lastLogEntry logEntry, lastLogIndex int) {
 }
 
 // not thread safe
-func (rf *Raft) sendHeartbeats() {
-	args := AppendEntriesArgs{}
-
-	args.Term = rf.currentTerm
-	args.LeaderID = rf.me
-	lastLogEntry, lastLogIndex := rf.getLastLogEntry()
-	args.PrevLogIndex = lastLogIndex
-	args.PrevLogTerm = lastLogEntry.Term
-	args.LeaderCommit = rf.commitIndex
-
-	for i := range rf.peers {
-		if i != rf.me {
-			go func(params AppendEntriesArgs, serverId int) {
-				reply := AppendEntriesReply{}
-				ok := rf.peers[serverId].Call("Raft.AppendEntries", &params, &reply)
-				rf.mu.Lock()
-				if ok {
-					rf.checkTerm(reply.Term)
-				}
-				rf.mu.Unlock()
-			}(args, i)
-		}
+func (rf *Raft) sendHeartbeat(serverID int, args AppendEntriesArgs) {
+	reply := AppendEntriesReply{}
+	ok := rf.peers[serverID].Call("Raft.AppendEntries", &args, &reply)
+	rf.mu.Lock()
+	if ok {
+		rf.checkTerm(reply.Term)
 	}
+	rf.mu.Unlock()
 }
 
 func (rf *Raft) appendNewLogEntriesProcess() {
 	const defaultPeriod = 20
 
-	rf.mu.Lock()
-	prevLogIndex := rf.commitIndex
-	rf.mu.Unlock()
-
 	for !rf.killed() {
 		rf.mu.Lock()
 		if rf.role == leader {
-			if (len(rf.log) - 1) > rf.commitIndex {
-				go rf.sendNewLogEntries(prevLogIndex)
-				prevLogIndex = len(rf.log) - 1
-			} else {
-				if logging {
-					fmt.Println("No new log. ", rf.me, " leader started sending heartbeats")
+			lastLogIndex := len(rf.log) - 1
+			for i := range rf.peers {
+				if i == rf.me {
+					continue
 				}
-				rf.sendHeartbeats()
+				if lastLogIndex >= rf.nextIndex[i] {
+					go rf.sendNewLogEntries(i, rf.nextIndex[i])
+				} else {
+					args := AppendEntriesArgs{}
+					args.Term = rf.currentTerm
+					args.LeaderID = rf.me
+					args.PrevLogIndex = lastLogIndex
+					args.PrevLogTerm = rf.log[lastLogIndex].Term
+					args.LeaderCommit = rf.commitIndex
+					go rf.sendHeartbeat(i, args)
+				}
 			}
 		}
 		rf.mu.Unlock()
 
 		time.Sleep(time.Duration(defaultPeriod) * time.Millisecond)
+	}
+}
+
+// not thread safe
+func (rf *Raft) initIndexMaps() {
+	for i := range rf.peers {
+		rf.nextIndex[i] = len(rf.log)
+		rf.matchIndex[i] = 0
 	}
 }
 
@@ -422,8 +433,8 @@ func (rf *Raft) sendRequestVote(args RequestVoteArgs, server int) {
 					fmt.Println("Newly elected leader: ", rf.me, " on term ", rf.currentTerm)
 				}
 				rf.role = leader
+				rf.initIndexMaps()
 				rf.resetElectionTimeout()
-				rf.sendHeartbeats()
 			}
 		}
 	}
@@ -533,7 +544,6 @@ func (rf *Raft) Main() {
 //
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
-	// Your code here, if desired.
 }
 
 func (rf *Raft) killed() bool {
@@ -561,7 +571,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCh = applyCh
 
 	rf.currentTerm = 0
-	rf.votedFor = -1 // -1 indicates null or "No vote"
+	rf.votedFor = -1
 	rf.log = append(rf.log, logEntry{Command: nil, Term: 0})
 
 	// initialize from state persisted before a crash
