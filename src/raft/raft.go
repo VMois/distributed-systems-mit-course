@@ -147,6 +147,30 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
+func (rf *Raft) applyNewEntriesProcess() {
+	const defaultPeriod = 20
+
+	rf.mu.Lock()
+	prevCommitIndex := rf.commitIndex
+	rf.mu.Unlock()
+
+	for !rf.killed() {
+		rf.mu.Lock()
+		if rf.commitIndex > prevCommitIndex {
+			if logging {
+				fmt.Println(rf.me, " applies new entries")
+			}
+			for i, entry := range rf.log[prevCommitIndex+1 : rf.commitIndex+1] {
+				rf.applyCh <- ApplyMsg{CommandValid: true, Command: entry.Command, CommandIndex: prevCommitIndex + 1 + i}
+			}
+			prevCommitIndex = rf.commitIndex
+		}
+		rf.mu.Unlock()
+
+		time.Sleep(time.Duration(defaultPeriod) * time.Millisecond)
+	}
+}
+
 // AppendEntriesArgs RPC argument struct. Fields must be in caps
 type AppendEntriesArgs struct {
 	Term         int
@@ -180,15 +204,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	rf.resetElectionTimeout()
 
-	// this is a hearbeat message
-	if len(args.Entries) == 0 {
-		if logging {
-			fmt.Println(rf.me, " received heartbeats from ", args.LeaderID)
-		}
-		reply.Success = true
-		return
-	}
-
 	if (len(rf.log) > args.PrevLogIndex) &&
 		(rf.log[args.PrevLogIndex].Term != args.PrevLogTerm) {
 		reply.Success = false
@@ -210,7 +225,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			}
 		} else {
 			rf.log = append(rf.log, newEntry)
-			rf.applyCh <- ApplyMsg{CommandValid: true, Command: newEntry.Command, CommandIndex: len(rf.log) - 1}
 		}
 	}
 
@@ -221,11 +235,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		} else {
 			rf.commitIndex = len(rf.log) - 1
 		}
-	}
-
-	if logging {
-		fmt.Println(rf.me, " applied new entries from ", args.LeaderID)
-		fmt.Println(rf.log)
 	}
 
 	reply.Success = true
@@ -270,9 +279,6 @@ func (rf *Raft) sendNewLogEntries(prevLogIndex int) {
 					fmt.Println(rf.me, " got a majority to commit new entries")
 				}
 				rf.commitIndex = prevLogIndex + len(args.Entries)
-				for i, entry := range args.Entries {
-					rf.applyCh <- ApplyMsg{CommandValid: true, Command: entry.Command, CommandIndex: prevLogIndex + 1 + i}
-				}
 				rf.mu.Unlock()
 				return
 			}
@@ -333,7 +339,7 @@ func (rf *Raft) sendHeartbeats() {
 	}
 }
 
-func (rf *Raft) logEntriesProcess() {
+func (rf *Raft) appendNewLogEntriesProcess() {
 	const defaultPeriod = 20
 
 	rf.mu.Lock()
@@ -510,7 +516,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // Main starts main server services
 func (rf *Raft) Main() {
 	go rf.electionProcess()
-	go rf.logEntriesProcess()
+	go rf.appendNewLogEntriesProcess()
+	go rf.applyNewEntriesProcess()
 }
 
 //
