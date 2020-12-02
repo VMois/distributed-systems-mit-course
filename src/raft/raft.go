@@ -85,6 +85,7 @@ type Raft struct {
 	electionTimeout int    // in ms
 	role            string // constants candidate, follower, leader
 	votesNum        int
+	applyCh         chan ApplyMsg
 }
 
 // choose randomly new electionTimeout
@@ -167,8 +168,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	// fmt.Println("Receive AppendEntries on ", rf.me, " from ", args.LeaderID)
-
 	rf.checkTerm(args.Term)
 
 	reply.Term = rf.currentTerm
@@ -196,6 +195,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
+	if logging {
+		fmt.Println(rf.me, " received new entries from ", args.LeaderID)
+	}
+
 	for i, newEntry := range args.Entries {
 		newIndex := args.PrevLogIndex + i + 1
 
@@ -207,6 +210,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			}
 		} else {
 			rf.log = append(rf.log, newEntry)
+			rf.applyCh <- ApplyMsg{CommandValid: true, Command: newEntry.Command, CommandIndex: len(rf.log) - 1}
 		}
 	}
 
@@ -218,21 +222,30 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.commitIndex = len(rf.log) - 1
 		}
 	}
+
+	if logging {
+		fmt.Println(rf.me, " applied new entries from ", args.LeaderID)
+		fmt.Println(rf.log)
+	}
+
 	reply.Success = true
 }
 
 // not thread safe
-func (rf *Raft) sendNewLogEntries() {
+func (rf *Raft) sendNewLogEntries(prevLogIndex int) {
 	args := AppendEntriesArgs{}
 
+	rf.mu.Lock()
 	args.Term = rf.currentTerm
 	args.LeaderID = rf.me
 
-	lastLogEntry, lastLogIndex := rf.getLastLogEntry()
-	args.PrevLogIndex = lastLogIndex
-	args.PrevLogTerm = lastLogEntry.Term
+	args.PrevLogIndex = prevLogIndex
+	args.PrevLogTerm = 0
+	args.PrevLogTerm = rf.log[prevLogIndex].Term
 	args.LeaderCommit = rf.commitIndex
-	args.Entries = rf.getNewEntries()
+	args.Entries = rf.getNewEntries(prevLogIndex)
+	rf.mu.Unlock()
+	approvedEntries := 0
 
 	for i := range rf.peers {
 		if i != rf.me {
@@ -243,11 +256,30 @@ func (rf *Raft) sendNewLogEntries() {
 				rf.mu.Lock()
 				if ok {
 					rf.checkTerm(reply.Term)
-					// here handle log append confirm/deny
+					approvedEntries++
 				}
 				rf.mu.Unlock()
 			}(args, i)
 		}
+	}
+	for !rf.killed() {
+		rf.mu.Lock()
+		if rf.role == leader {
+			if approvedEntries > (len(rf.peers) / 2) {
+				if logging {
+					fmt.Println(rf.me, " got a majority to commit new entries")
+				}
+				rf.commitIndex = prevLogIndex + len(args.Entries)
+				for i, entry := range args.Entries {
+					rf.applyCh <- ApplyMsg{CommandValid: true, Command: entry.Command, CommandIndex: prevLogIndex + 1 + i}
+				}
+				rf.mu.Unlock()
+				return
+			}
+		}
+		rf.mu.Unlock()
+
+		time.Sleep(time.Duration(5) * time.Millisecond)
 	}
 }
 
@@ -262,14 +294,11 @@ func (rf *Raft) checkTerm(term int) {
 }
 
 // not thread safe
-// TODO: function is not correct needs fixes
-func (rf *Raft) getNewEntries() []logEntry {
-	_, lastLogIndex := rf.getLastLogEntry()
-	return rf.log[rf.commitIndex+1 : lastLogIndex+1]
+func (rf *Raft) getNewEntries(prevLogIndex int) []logEntry {
+	return rf.log[prevLogIndex+1 : len(rf.log)]
 }
 
 // not thread safe
-// TODO: function is not correct, needs fixes
 func (rf *Raft) getLastLogEntry() (lastLogEntry logEntry, lastLogIndex int) {
 	lastIndex := len(rf.log) - 1
 	if lastIndex >= 0 {
@@ -305,13 +334,18 @@ func (rf *Raft) sendHeartbeats() {
 }
 
 func (rf *Raft) logEntriesProcess() {
-	const defaultPeriod = 10
+	const defaultPeriod = 20
+
+	rf.mu.Lock()
+	prevLogIndex := rf.commitIndex
+	rf.mu.Unlock()
 
 	for !rf.killed() {
 		rf.mu.Lock()
 		if rf.role == leader {
 			if (len(rf.log) - 1) > rf.commitIndex {
-				rf.sendNewLogEntries()
+				go rf.sendNewLogEntries(prevLogIndex)
+				prevLogIndex = len(rf.log) - 1
 			} else {
 				if logging {
 					fmt.Println("No new log. ", rf.me, " leader started sending heartbeats")
@@ -344,8 +378,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	// fmt.Println("Receive vote request on ", rf.me, " from ", args.CandidateID)
-
 	// new election term, reset
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
@@ -369,8 +401,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 func (rf *Raft) sendRequestVote(args RequestVoteArgs, server int) {
 	reply := RequestVoteReply{}
-
-	// fmt.Println("Sending vote request from ", rf.me, " to ", server)
 	ok := rf.peers[server].Call("Raft.RequestVote", &args, &reply)
 
 	rf.mu.Lock()
@@ -378,7 +408,6 @@ func (rf *Raft) sendRequestVote(args RequestVoteArgs, server int) {
 		rf.checkTerm(reply.Term)
 
 		if reply.VoteGranted && rf.role == candidate {
-			// fmt.Println("Granted vote from ", server, " to ", rf.me)
 			rf.votesNum++
 
 			// if majority votes, become leader
@@ -407,9 +436,6 @@ func (rf *Raft) electionProcess() {
 		}
 
 		if rf.electionTimeout <= 0 {
-			if logging {
-				fmt.Println(rf.me, " starts election process")
-			}
 			rf.startElection()
 		}
 
@@ -426,6 +452,10 @@ func (rf *Raft) electionProcess() {
 
 // not thread safe
 func (rf *Raft) startElection() {
+	if logging {
+		fmt.Println(rf.me, " starts election process on term: ", rf.currentTerm+1)
+	}
+
 	rf.role = candidate
 	rf.currentTerm++
 	rf.votedFor = rf.me
@@ -521,15 +551,20 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.applyCh = applyCh
 
 	rf.currentTerm = 0
 	rf.votedFor = -1 // -1 indicates null or "No vote"
+	rf.log = append(rf.log, logEntry{Command: nil, Term: 0})
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
-	rf.commitIndex = -1
-	rf.lastApplied = -1
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+
+	rf.nextIndex = make(map[int]int)
+	rf.matchIndex = make(map[int]int)
 
 	rf.role = follower
 	rf.votesNum = 0
