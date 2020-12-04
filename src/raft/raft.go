@@ -19,6 +19,7 @@ package raft
 
 import (
 	"fmt"
+	"math"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -147,8 +148,13 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
+// not thread safe
+func (rf *Raft) getMajorityServersNumber() int {
+	return int(math.Round(float64(len(rf.peers)) / 2.0))
+}
+
 func (rf *Raft) applyNewEntriesProcess() {
-	const defaultPeriod = 20
+	const defaultPeriod = 10
 
 	rf.mu.Lock()
 	prevCommitIndex := rf.commitIndex
@@ -164,16 +170,16 @@ func (rf *Raft) applyNewEntriesProcess() {
 				if rf.log[n].Term != rf.currentTerm {
 					break
 				}
-				count := 0
 
+				count := 1
 				for i := range rf.peers {
-					if rf.matchIndex[i] >= n {
+					if (i != rf.me) && (rf.matchIndex[i] >= n) {
 						count++
 					}
 				}
 
 				// no majority
-				if count < (len(rf.peers) / 2) {
+				if count < rf.getMajorityServersNumber() {
 					break
 				}
 				n++
@@ -183,7 +189,7 @@ func (rf *Raft) applyNewEntriesProcess() {
 
 		if rf.commitIndex > prevCommitIndex {
 			if logging {
-				fmt.Println(rf.me, " applies new entries")
+				fmt.Println(rf.me, " applies new entries. Term: ", rf.currentTerm)
 			}
 			for i, entry := range rf.log[prevCommitIndex+1 : rf.commitIndex+1] {
 				rf.applyCh <- ApplyMsg{CommandValid: true, Command: entry.Command, CommandIndex: prevCommitIndex + 1 + i}
@@ -229,6 +235,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	rf.resetElectionTimeout()
 
+	if (len(rf.log) - 1) < args.PrevLogIndex {
+		reply.Success = false
+		return
+	}
+
+	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.Success = false
+		return
+	}
+
 	if (len(rf.log) > args.PrevLogIndex) &&
 		(rf.log[args.PrevLogIndex].Term != args.PrevLogTerm) {
 		reply.Success = false
@@ -237,9 +253,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	if logging {
 		if len(args.Entries) > 0 {
-			fmt.Println(rf.me, " received new entries from ", args.LeaderID, "Len: ", len(args.Entries))
+			fmt.Println(rf.me, " received new entries from ", args.LeaderID, "Term:", rf.currentTerm, "Len: ", len(args.Entries))
 		} else {
-			fmt.Println(rf.me, " received heartbeat from ", args.LeaderID)
+			fmt.Println(rf.me, " received heartbeat from ", args.LeaderID, "Term: ", rf.currentTerm)
 		}
 	}
 
@@ -270,9 +286,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 }
 
 func (rf *Raft) sendNewLogEntries(serverID int, nextIndexForServer int) {
-	if logging {
-		fmt.Println(rf.me, " is sending new logs for ", serverID, " starting ", nextIndexForServer)
-	}
 	args := AppendEntriesArgs{}
 
 	rf.mu.Lock()
@@ -288,11 +301,23 @@ func (rf *Raft) sendNewLogEntries(serverID int, nextIndexForServer int) {
 	args.Entries = rf.log[nextIndexForServer : lastLogIndex+1]
 	rf.mu.Unlock()
 
+	if logging {
+		if len(args.Entries) > 0 {
+			fmt.Println(rf.me, " is sending new logs for ", serverID, " starting ", nextIndexForServer)
+		}
+	}
+
 	reply := AppendEntriesReply{}
 	ok := rf.peers[serverID].Call("Raft.AppendEntries", &args, &reply)
 	rf.mu.Lock()
 	if ok {
+		if logging {
+			if len(args.Entries) > 0 {
+				fmt.Println(rf.me, " receives append response from ", serverID, "Status:", reply.Success, "Start:", nextIndexForServer, "Term: ", rf.currentTerm)
+			}
+		}
 		rf.checkTerm(reply.Term)
+
 		if reply.Success {
 			rf.nextIndex[serverID] = lastLogIndex + 1
 			rf.matchIndex[serverID] = lastLogIndex
@@ -327,17 +352,6 @@ func (rf *Raft) getLastLogEntry() (lastLogEntry logEntry, lastLogIndex int) {
 	return logEntry{Command: nil, Term: 0}, -1
 }
 
-// not thread safe
-func (rf *Raft) sendHeartbeat(serverID int, args AppendEntriesArgs) {
-	reply := AppendEntriesReply{}
-	ok := rf.peers[serverID].Call("Raft.AppendEntries", &args, &reply)
-	rf.mu.Lock()
-	if ok {
-		rf.checkTerm(reply.Term)
-	}
-	rf.mu.Unlock()
-}
-
 func (rf *Raft) appendNewLogEntriesProcess() {
 	const defaultPeriod = 20
 
@@ -352,13 +366,8 @@ func (rf *Raft) appendNewLogEntriesProcess() {
 				if lastLogIndex >= rf.nextIndex[i] {
 					go rf.sendNewLogEntries(i, rf.nextIndex[i])
 				} else {
-					args := AppendEntriesArgs{}
-					args.Term = rf.currentTerm
-					args.LeaderID = rf.me
-					args.PrevLogIndex = lastLogIndex
-					args.PrevLogTerm = rf.log[lastLogIndex].Term
-					args.LeaderCommit = rf.commitIndex
-					go rf.sendHeartbeat(i, args)
+					// heartbeat
+					go rf.sendNewLogEntries(i, lastLogIndex+1)
 				}
 			}
 		}
@@ -395,12 +404,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	// new election term, reset
-	if args.Term > rf.currentTerm {
-		rf.currentTerm = args.Term
-		rf.role = follower
-		rf.votedFor = -1
-	}
+	rf.checkTerm(args.Term)
 
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
@@ -428,7 +432,7 @@ func (rf *Raft) sendRequestVote(args RequestVoteArgs, server int) {
 			rf.votesNum++
 
 			// if majority votes, become leader
-			if rf.votesNum > (len(rf.peers) / 2) {
+			if rf.votesNum >= rf.getMajorityServersNumber() {
 				if logging {
 					fmt.Println("Newly elected leader: ", rf.me, " on term ", rf.currentTerm)
 				}
