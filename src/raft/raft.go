@@ -162,10 +162,6 @@ func (rf *Raft) applyNewEntriesProcess() {
 			// Raft (Extended), fig. 2, Rules for Servers/Leades
 			n := rf.commitIndex + 1
 			for n <= len(rf.log)-1 {
-				if rf.log[n].Term != rf.currentTerm {
-					break
-				}
-
 				count := 1
 				for i := range rf.peers {
 					if (i != rf.me) && (rf.matchIndex[i] >= n) {
@@ -173,13 +169,11 @@ func (rf *Raft) applyNewEntriesProcess() {
 					}
 				}
 
-				// no majority
-				if count < rf.getMajorityServersNumber() {
-					break
+				if (count >= rf.getMajorityServersNumber()) && (rf.log[n].Term == rf.currentTerm) {
+					rf.commitIndex = n
 				}
 				n++
 			}
-			rf.commitIndex = n - 1
 		}
 
 		if rf.commitIndex > rf.lastApplied {
