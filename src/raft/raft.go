@@ -154,7 +154,7 @@ func (rf *Raft) getMajorityServersNumber() int {
 }
 
 func (rf *Raft) applyNewEntriesProcess() {
-	const defaultPeriod = 10
+	const defaultPeriod = 40
 
 	for !rf.killed() {
 		rf.mu.Lock()
@@ -181,9 +181,11 @@ func (rf *Raft) applyNewEntriesProcess() {
 				fmt.Println(rf.me, " applies new entries. Term: ", rf.currentTerm)
 			}
 
-			rf.lastApplied++
-			entry := rf.log[rf.lastApplied]
-			rf.applyCh <- ApplyMsg{CommandValid: true, Command: entry.Command, CommandIndex: rf.lastApplied}
+			for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+				entry := rf.log[i]
+				rf.applyCh <- ApplyMsg{CommandValid: true, Command: entry.Command, CommandIndex: i}
+			}
+			rf.lastApplied = rf.commitIndex
 		}
 		rf.mu.Unlock()
 
@@ -342,7 +344,7 @@ func (rf *Raft) getLastLogEntry() (lastLogEntry logEntry, lastLogIndex int) {
 }
 
 func (rf *Raft) appendNewLogEntriesProcess() {
-	const defaultPeriod = 20
+	const defaultPeriod = 80
 
 	for !rf.killed() {
 		rf.mu.Lock()
