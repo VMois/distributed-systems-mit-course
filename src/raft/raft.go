@@ -159,7 +159,6 @@ func (rf *Raft) applyNewEntriesProcess() {
 	for !rf.killed() {
 		rf.mu.Lock()
 		if rf.role == leader {
-
 			// Raft (Extended), fig. 2, Rules for Servers/Leades
 			n := rf.commitIndex + 1
 			for n <= len(rf.log)-1 {
@@ -512,9 +511,10 @@ func (rf *Raft) startElection() {
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	term, isLeader := rf.GetState()
 	rf.mu.Lock()
 	index := len(rf.log)
+	term := rf.currentTerm
+	isLeader := rf.role == leader
 	if isLeader {
 		newEntry := logEntry{Command: command, Term: term}
 		rf.log = append(rf.log, newEntry)
