@@ -156,13 +156,9 @@ func (rf *Raft) getMajorityServersNumber() int {
 func (rf *Raft) applyNewEntriesProcess() {
 	const defaultPeriod = 10
 
-	rf.mu.Lock()
-	prevCommitIndex := rf.commitIndex
-	rf.mu.Unlock()
-
 	for !rf.killed() {
 		rf.mu.Lock()
-		if rf.role == leader && ((len(rf.log) - 1) > rf.commitIndex) {
+		if rf.role == leader {
 
 			// Raft (Extended), fig. 2, Rules for Servers/Leades
 			n := rf.commitIndex + 1
@@ -187,14 +183,14 @@ func (rf *Raft) applyNewEntriesProcess() {
 			rf.commitIndex = n - 1
 		}
 
-		if rf.commitIndex > prevCommitIndex {
+		if rf.commitIndex > rf.lastApplied {
 			if logging {
 				fmt.Println(rf.me, " applies new entries. Term: ", rf.currentTerm)
 			}
-			for i, entry := range rf.log[prevCommitIndex+1 : rf.commitIndex+1] {
-				rf.applyCh <- ApplyMsg{CommandValid: true, Command: entry.Command, CommandIndex: prevCommitIndex + 1 + i}
-			}
-			prevCommitIndex = rf.commitIndex
+
+			rf.lastApplied++
+			entry := rf.log[rf.lastApplied]
+			rf.applyCh <- ApplyMsg{CommandValid: true, Command: entry.Command, CommandIndex: rf.lastApplied}
 		}
 		rf.mu.Unlock()
 
@@ -265,7 +261,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// some entries exist after newIndex
 		if len(rf.log) > newIndex {
 			if newEntry.Term != rf.log[newIndex].Term {
-				rf.log = rf.log[:newIndex-1]
+				rf.log = rf.log[:newIndex]
 				rf.log = append(rf.log, newEntry)
 			}
 		} else {
