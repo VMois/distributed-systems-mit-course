@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"bytes"
 	"fmt"
 	"math"
 	"math/rand"
@@ -25,6 +26,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"../labgob"
 	"../labrpc"
 )
 
@@ -110,42 +112,37 @@ func (rf *Raft) GetState() (int, bool) {
 	return term, isLeader
 }
 
-//
-// save Raft's persistent state to stable storage,
-// where it can later be retrieved after a crash and restart.
-// see paper's Figure 2 for a description of what should be persistent.
-//
+// not thread safe, save Raft's persistent state to stable storage
 func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
-//
-// restore previously persisted state.
-//
+// not thread safe, restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var log []logEntry
+
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&log) != nil {
+		fmt.Println("Error reading persist")
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = log
+	}
 }
 
 // not thread safe
@@ -279,6 +276,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 func (rf *Raft) sendNewLogEntries(serverID int, nextIndexForServer int) {
 	args := AppendEntriesArgs{}
 
+	// TODO: move args prepare to separate function
+	//       and call in appendNewLogEntriesProcess
 	rf.mu.Lock()
 	args.Term = rf.currentTerm
 	args.LeaderID = rf.me
@@ -324,8 +323,9 @@ func (rf *Raft) sendNewLogEntries(serverID int, nextIndexForServer int) {
 func (rf *Raft) checkTerm(term int) {
 	if term > rf.currentTerm {
 		rf.currentTerm = term
-		rf.role = follower
 		rf.votedFor = -1
+		rf.role = follower
+		rf.persist()
 	}
 }
 
@@ -337,10 +337,7 @@ func (rf *Raft) getNewEntries(prevLogIndex int) []logEntry {
 // not thread safe
 func (rf *Raft) getLastLogEntry() (lastLogEntry logEntry, lastLogIndex int) {
 	lastIndex := len(rf.log) - 1
-	if lastIndex >= 0 {
-		return rf.log[lastIndex], lastIndex
-	}
-	return logEntry{Command: nil, Term: 0}, -1
+	return rf.log[lastIndex], lastIndex
 }
 
 func (rf *Raft) appendNewLogEntriesProcess() {
@@ -471,6 +468,7 @@ func (rf *Raft) startElection() {
 	rf.role = candidate
 	rf.currentTerm++
 	rf.votedFor = rf.me
+	rf.persist()
 	rf.votesNum = 1
 	rf.resetElectionTimeout()
 
@@ -514,6 +512,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if isLeader {
 		newEntry := logEntry{Command: command, Term: term}
 		rf.log = append(rf.log, newEntry)
+		rf.persist()
 	}
 	rf.mu.Unlock()
 
