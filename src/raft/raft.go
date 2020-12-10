@@ -202,8 +202,10 @@ type AppendEntriesArgs struct {
 
 // AppendEntriesReply RPC reply struct. Fields must be in caps
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term          int
+	Success       bool
+	ConflictIndex int
+	ConflictTerm  int
 }
 
 // AppendEntries handles hearbeats and new log entries
@@ -222,20 +224,22 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	rf.resetElectionTimeout()
+	reply.Success = false
 
-	if (len(rf.log) - 1) < args.PrevLogIndex {
-		reply.Success = false
+	if args.PrevLogIndex >= len(rf.log) {
+		reply.ConflictIndex = len(rf.log)
+		reply.ConflictTerm = -1
 		return
 	}
 
 	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		reply.Success = false
-		return
-	}
-
-	if (len(rf.log) > args.PrevLogIndex) &&
-		(rf.log[args.PrevLogIndex].Term != args.PrevLogTerm) {
-		reply.Success = false
+		reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
+		for i := args.PrevLogIndex - 1; i >= 0; i-- {
+			if rf.log[i].Term != reply.ConflictTerm {
+				reply.ConflictIndex = i + 1
+				break
+			}
+		}
 		return
 	}
 
@@ -312,7 +316,16 @@ func (rf *Raft) sendNewLogEntries(serverID int, nextIndexForServer int) {
 			rf.nextIndex[serverID] = lastLogIndex + 1
 			rf.matchIndex[serverID] = lastLogIndex
 		} else {
-			rf.nextIndex[serverID]--
+			rf.nextIndex[serverID] = reply.ConflictIndex
+
+			if reply.ConflictTerm >= 0 {
+				for i := len(rf.log) - 1; i >= 0; i-- {
+					if rf.log[i].Term == reply.ConflictTerm {
+						rf.nextIndex[serverID] = i + 1
+						break
+					}
+				}
+			}
 		}
 	}
 	rf.mu.Unlock()
