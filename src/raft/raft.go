@@ -151,7 +151,7 @@ func (rf *Raft) getMajorityServersNumber() int {
 }
 
 func (rf *Raft) applyNewEntriesProcess() {
-	const defaultPeriod = 40
+	const defaultPeriod = 30
 
 	for !rf.killed() {
 		rf.mu.Lock()
@@ -216,15 +216,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.checkTerm(args.Term)
 
 	reply.Term = rf.currentTerm
+	reply.Success = false
 
 	// request comes from the "past" term, ignore request
 	if args.Term < rf.currentTerm {
-		reply.Success = false
 		return
 	}
 
 	rf.resetElectionTimeout()
-	reply.Success = false
 
 	if args.PrevLogIndex >= len(rf.log) {
 		reply.ConflictIndex = len(rf.log)
@@ -234,6 +233,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
+		reply.ConflictIndex = args.PrevLogIndex
 		for i := args.PrevLogIndex - 1; i >= 0; i-- {
 			if rf.log[i].Term != reply.ConflictTerm {
 				reply.ConflictIndex = i + 1
@@ -301,7 +301,7 @@ func (rf *Raft) sendNewLogEntries(serverID int, nextIndexForServer int) {
 
 	if logging {
 		if len(args.Entries) > 0 {
-			fmt.Println(rf.me, " is sending new logs for ", serverID, " starting ", nextIndexForServer)
+			fmt.Println(rf.me, " is sending new logs for ", serverID, " starting ", nextIndexForServer, "Term:", args.Term)
 		}
 	}
 
@@ -316,23 +316,25 @@ func (rf *Raft) sendNewLogEntries(serverID int, nextIndexForServer int) {
 		}
 		rf.checkTerm(reply.Term)
 
-		if reply.Success {
-			rf.nextIndex[serverID] = lastLogIndex + 1
-			rf.matchIndex[serverID] = lastLogIndex
-		} else {
+		if rf.role == leader {
+			if reply.Success {
+				rf.nextIndex[serverID] = lastLogIndex + 1
+				rf.matchIndex[serverID] = lastLogIndex
+			} else {
 
-			if logging {
-				fmt.Println(rf.me, " receives reject AppendReply from ", serverID,
-					" ConflictIndex: ", reply.ConflictIndex, " ConflictTerm: ", reply.ConflictTerm)
-			}
+				if logging {
+					fmt.Println(rf.me, " receives reject AppendReply from ", serverID,
+						" ConflictIndex: ", reply.ConflictIndex, " ConflictTerm: ", reply.ConflictTerm)
+				}
 
-			rf.nextIndex[serverID] = reply.ConflictIndex
+				rf.nextIndex[serverID] = reply.ConflictIndex
 
-			if reply.ConflictTerm >= 0 {
-				for i := len(rf.log) - 1; i >= 0; i-- {
-					if rf.log[i].Term == reply.ConflictTerm {
-						rf.nextIndex[serverID] = i + 1
-						break
+				if reply.ConflictTerm >= 0 {
+					for i := len(rf.log) - 1; i >= 0; i-- {
+						if rf.log[i].Term == reply.ConflictTerm {
+							rf.nextIndex[serverID] = i + 1
+							break
+						}
 					}
 				}
 			}
@@ -364,7 +366,7 @@ func (rf *Raft) getLastLogEntry() (lastLogEntry logEntry, lastLogIndex int) {
 }
 
 func (rf *Raft) appendNewLogEntriesProcess() {
-	const defaultPeriod = 80
+	const defaultPeriod = 50
 
 	for !rf.killed() {
 		rf.mu.Lock()
