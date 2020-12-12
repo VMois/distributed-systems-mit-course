@@ -265,6 +265,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 	}
 
+	if len(args.Entries) > 0 {
+		rf.persist()
+	}
+
 	if args.LeaderCommit > rf.commitIndex {
 		// choose min, code here needs improvement
 		if args.LeaderCommit < len(rf.log)-1 {
@@ -421,6 +425,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		if (lastLogEntry.Term < args.LastLogTerm) ||
 			((lastLogEntry.Term == args.LastLogTerm) && (lastLogIndex <= args.LastLogIndex)) {
 			rf.votedFor = args.CandidateID
+			rf.persist()
 			rf.resetElectionTimeout()
 			reply.VoteGranted = true
 		}
