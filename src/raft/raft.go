@@ -316,6 +316,12 @@ func (rf *Raft) sendNewLogEntries(serverID int, nextIndexForServer int) {
 			rf.nextIndex[serverID] = lastLogIndex + 1
 			rf.matchIndex[serverID] = lastLogIndex
 		} else {
+
+			if logging {
+				fmt.Println(rf.me, " receives reject AppendReply from ", serverID,
+					" ConflictIndex: ", reply.ConflictIndex, " ConflictTerm: ", reply.ConflictTerm)
+			}
+
 			rf.nextIndex[serverID] = reply.ConflictIndex
 
 			if reply.ConflictTerm >= 0 {
