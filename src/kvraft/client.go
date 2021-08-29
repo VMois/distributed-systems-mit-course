@@ -4,11 +4,17 @@ import "../labrpc"
 import "crypto/rand"
 import "math/big"
 import "fmt"
+import "time"
+
+const (
+    PUT_OPERATION = "Put"
+    APPEND_OPERATION = "Append"
+)
 
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
-	// You will have to modify this struct.
+	currentLeader *labrpc.ClientEnd
 }
 
 func nrand() int64 {
@@ -42,16 +48,31 @@ func (ck *Clerk) Get(key string) string {
     reply := GetReply{}
 
     args.Key = key
-    fmt.Println("send get")
 
-    for _, server := range ck.servers {
-        server.Call("KVServer.Get", &args, &reply)
-        //fmt.Println(ok)
-        /*if ok && reply.Err == OK {
-            fmt.Println(reply.Value)
-        }*/
+    // we might know current leader
+    if ck.currentLeader != nil {
+        ok := ck.currentLeader.Call("KVServer.Get", &args, &reply)
+        if ok && reply.Err == OK {
+            return reply.Value
+        }
+
+        if ok && reply.Err == ErrWrongLeader {
+            fmt.Println("Leader changed")
+            ck.currentLeader = nil
+        }
     }
-	return ""
+
+    for ck.currentLeader == nil {
+        for _, server := range ck.servers {
+            ok := server.Call("KVServer.Get", &args, &reply)
+            if ok && reply.Err == OK {
+                ck.currentLeader = server
+                return reply.Value
+            }
+        }
+        time.Sleep(200 * time.Millisecond)
+    }
+    return ""
 }
 
 //
@@ -65,12 +86,41 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	// You will have to modify this function.
+    args := PutAppendArgs{}
+    reply := PutAppendReply{}
+
+    args.Key = key
+    args.Value = value
+    args.Op = op
+
+    // we might know current leader
+    if ck.currentLeader != nil {
+        ok := ck.currentLeader.Call("KVServer.PutAppend", &args, &reply)
+        if ok && reply.Err == OK {
+            return
+        }
+
+        if ok && reply.Err == ErrWrongLeader {
+            fmt.Println("Leader changed")
+            ck.currentLeader = nil
+        }
+    }
+
+    for ck.currentLeader == nil {
+        for _, server := range ck.servers {
+            ok := server.Call("KVServer.PutAppend", &args, &reply)
+            if ok && reply.Err == OK {
+                ck.currentLeader = server
+                return
+            }
+        }
+        time.Sleep(200 * time.Millisecond)
+    }
 }
 
 func (ck *Clerk) Put(key string, value string) {
-	ck.PutAppend(key, value, "Put")
+	ck.PutAppend(key, value, PUT_OPERATION)
 }
 func (ck *Clerk) Append(key string, value string) {
-	ck.PutAppend(key, value, "Append")
+	ck.PutAppend(key, value, APPEND_OPERATION)
 }

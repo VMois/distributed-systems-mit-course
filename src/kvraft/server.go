@@ -7,14 +7,17 @@ import (
 	"../raft"
 	"sync"
 	"sync/atomic"
-	"time"
 	"fmt"
 )
 
 const (
     Debug = 0
+
     GET_OPCODE = 1
     PUT_OPCODE = 2
+    APPEND_OPCODE = 3
+
+    OPS_TOPIC = "operations"
 )
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
@@ -29,9 +32,11 @@ type Op struct {
     Code int
     Key string
     Value string
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+}
+
+type OpResult struct {
+    Index int
+    Value string
 }
 
 type KVServer struct {
@@ -41,6 +46,7 @@ type KVServer struct {
 	applyCh chan raft.ApplyMsg
 	dead    int32 // set by Kill()
 	store   map[string]string
+	pubsub  *Pubsub
 
 	maxraftstate int // snapshot if log grows this big
 
@@ -49,36 +55,66 @@ type KVServer struct {
 
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
+    fmt.Printf("%d server, received GET \n", kv.me)
     reply.Err = OK
     _, isLeader := kv.rf.GetState()
-    fmt.Println(isLeader)
     if isLeader != true {
-        // fmt.Println("not leader")
-        //reply.Err = ErrWrongLeader
-        //reply.Value = ""
+        reply.Err = ErrWrongLeader
+        reply.Value = ""
         return
     }
-    fmt.Println("leader")
+
     op := Op{Code: GET_OPCODE, Key: args.Key, Value: ""}
     opIndex, _, _ := kv.rf.Start(op)
-    fmt.Println("op 1")
+    fmt.Printf("%d server, Get, waiting for index: %d \n", kv.me, opIndex)
 
-    select {
-        case msg := <- kv.applyCh:
-            if msg.CommandIndex == opIndex {
-                kv.mu.Lock()
-                reply.Value = kv.store[op.Key]
-                return
-            }
-            // wait more
-        case <-time.After(2 * time.Second):
-            fmt.Println("timeout 1")
+    opsChan := kv.pubsub.Subscribe(OPS_TOPIC)
+
+    for {
+        msg := <- opsChan
+        if msg.Index == opIndex {
+            fmt.Printf("%d server, Get, finished index: %d \n", kv.me, opIndex)
+            reply.Value = msg.Value
+            kv.pubsub.Unsubscribe(OPS_TOPIC, opsChan)
+            return
+        }
     }
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
-	fmt.Println("hello")
+    fmt.Printf("%d server, received PutAppend\n", kv.me)
+	reply.Err = OK
+    _, isLeader := kv.rf.GetState()
+
+    if isLeader != true {
+        reply.Err = ErrWrongLeader
+        return
+    }
+
+    op := Op{}
+    op.Key = args.Key
+    op.Value = args.Value
+
+    if args.Op == PUT_OPERATION {
+        op.Code = PUT_OPCODE
+    } else if args.Op == APPEND_OPERATION {
+        op.Code = APPEND_OPCODE
+    }
+
+    opIndex, _, _ := kv.rf.Start(op)
+    fmt.Printf("%d server, PutAppend, waiting for index: %d\n", kv.me, opIndex)
+
+    opsChan := kv.pubsub.Subscribe(OPS_TOPIC)
+
+    for {
+        msg := <- opsChan
+        fmt.Println(msg)
+        if msg.Index == opIndex {
+            fmt.Printf("%d server, PutAppend, finished index: %d\n", kv.me, opIndex)
+            kv.pubsub.Unsubscribe(OPS_TOPIC, opsChan)
+            return
+        }
+    }
 }
 
 //
@@ -94,12 +130,36 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
-	// Your code here, if desired.
+	kv.pubsub.Close()
 }
 
 func (kv *KVServer) killed() bool {
 	z := atomic.LoadInt32(&kv.dead)
 	return z == 1
+}
+
+func (kv *KVServer) applyOperations() {
+    for !kv.killed() {
+        msg := <- kv.applyCh
+        opRes := OpResult{}
+        opRes.Index = msg.CommandIndex
+
+        op := msg.Command.(Op)
+
+        if op.Code == PUT_OPCODE {
+            fmt.Printf("%d server, apply PUT, index: %d \n", kv.me, opRes.Index)
+            kv.store[op.Key] = op.Value
+            opRes.Value = ""
+        } else if op.Code == APPEND_OPCODE {
+            fmt.Printf("%d server, apply APPEND, index: %d \n", kv.me, opRes.Index)
+            kv.store[op.Key] += op.Value
+            opRes.Value = ""
+        } else if op.Code == GET_OPCODE {
+            fmt.Printf("%d server, apply GET, index: %d \n", kv.me, opRes.Index)
+            opRes.Value = kv.store[op.Key]
+        }
+        kv.pubsub.Publish(OPS_TOPIC, opRes)
+    }
 }
 
 //
@@ -124,15 +184,14 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv := new(KVServer)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
+	kv.pubsub = NewPubsub()
 
 	kv.store = make(map[string]string)
-
-	// You may need initialization code here.
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
-	// You may need initialization code here.
+	go kv.applyOperations()
 
 	return kv
 }
