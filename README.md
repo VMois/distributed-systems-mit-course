@@ -1,6 +1,6 @@
 # MIT 6.824 Distributed Systems (Spring 2020) course
 
-My notes and solutions for the 6.824 course. [Official website](https://pdos.csail.mit.edu/6.824/).
+My notes and solutions for the 6.824 course. [Official website](http://nil.csail.mit.edu/6.824/2020/).
 
 ## Papers
 
